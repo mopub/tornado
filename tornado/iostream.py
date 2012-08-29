@@ -206,10 +206,8 @@ class IOStream(object):
                     self._write_buffer.append(data[i:i + WRITE_BUFFER_CHUNK_SIZE])
             else:
                 self._write_buffer.append(data)
+        self._add_io_state(self.io_loop.WRITE)
         self._write_callback = stack_context.wrap(callback)
-        self._handle_write()
-        if self._write_buffer:
-            self._add_io_state(self.io_loop.WRITE)
         self._maybe_add_error_listener()
 
     def set_close_callback(self, callback):
