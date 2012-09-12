@@ -34,6 +34,22 @@ except ImportError:
 
 _DEFAULT_CA_CERTS = os.path.dirname(__file__) + '/ca-certificates.crt'
 
+# We now have 3 different timeouts for outbound http requests.
+# The request lifecycle has 4 major milestones:
+# (1) enters the queue, waiting to be processed
+# (2) exits the queue, _HTTPConnection object created
+# (3) connection made successfully, request sent
+# (4) request completed
+# The 3 different timeout clocks start and stop at different milestones:
+# queue_timeout   = from (1) to (2)
+# connect_timeout = from (2) to (3)
+# request_timeout = from (2) to (4)
+# Right now the queue_timeout is a constant, the same for all requests, but we could easily make it configurable per request.
+QUEUE_TIMEOUT_SECONDS = 2.0
+
+MAX_QUEUE_SIZE = 500
+MAX_REQUEST_TIMEOUT_SECONDS = 2.0
+
 
 class SimpleAsyncHTTPClient(AsyncHTTPClient):
     """Non-blocking HTTP client with no external dependencies.
@@ -84,7 +100,7 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
         max_buffer_size is the number of bytes that can be read by IOStream. It
         defaults to 100mb.
         """
-        self.io_loop = io_loop
+        self.io_loop = io_loop or IOLoop.instance()
         self.max_clients = max_clients
         self.queue = collections.deque()
         self.active = {}
@@ -94,22 +110,40 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
     def fetch(self, request, callback, **kwargs):
         if not isinstance(request, HTTPRequest):
             request = HTTPRequest(url=request, **kwargs)
+
+        # Enforce a maximum timeout. This is necessary to keep the outbound request processing throughput up.
+        # If requests do not have a timeout, they can occupy a spot in the client pool forever.
+        if request.request_timeout is None or request.request_timeout > MAX_REQUEST_TIMEOUT_SECONDS:
+            request.request_timeout = MAX_REQUEST_TIMEOUT_SECONDS
+
         # We're going to modify this (to add Host, Accept-Encoding, etc),
         # so make sure we don't modify the caller's object.  This is also
         # where normal dicts get converted to HTTPHeaders objects.
         request.headers = HTTPHeaders(request.headers)
         callback = stack_context.wrap(callback)
-        self.queue.append((request, callback))
+        self.queue.append(_QueuedRequest(self, request, callback))
         self._process_queue()
         if self.queue:
             logging.debug("max_clients limit reached, request queued. "
                           "%d active, %d queued requests." % (
-                    len(self.active), len(self.queue)))
+                            len(self.active), len(self.queue)))
 
     def _process_queue(self):
         with stack_context.NullContext():
+            # TODO(simon): Log the queue size to statsd.
+
+            while len(self.queue) > MAX_QUEUE_SIZE:
+                # The queue is too big. We must discard some requests to prevent getting more and more backed up and blowing up memory.
+                queued_request = self.queue.popleft()
+                queued_request.cancel_timeout()
+                queued_request.on_queue_timeout(remove_from_queue = False,  # We already removed it, just now.
+                                                error_msg = "Request ejected from wait queue because the queue got too big")
+
             while self.queue and len(self.active) < self.max_clients:
-                request, callback = self.queue.popleft()
+                queued_request = self.queue.popleft()
+                queued_request.cancel_timeout()
+                request = queued_request.request
+                callback = queued_request.callback
                 key = object()
                 self.active[key] = (request, callback)
                 _HTTPConnection(self.io_loop, self, request,
@@ -120,6 +154,45 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
     def _release_fetch(self, key):
         del self.active[key]
         self._process_queue()
+
+
+class _QueuedRequest(object):
+    def __init__(self, async_http_client, request, callback):
+        self.async_http_client = async_http_client
+        self.request = request
+        self.callback = callback
+        self.queue_timeout_handle = self.async_http_client.io_loop.add_timeout(
+                                            time.time() + QUEUE_TIMEOUT_SECONDS, # TODO(simon): Make this timeout length configurable?
+                                            self.on_queue_timeout)
+        self.already_timed_out = False
+
+    def on_queue_timeout(self, remove_from_queue = True, error_msg = "Timeout while waiting in queue"):
+        """ Called when the request sits in the queue for too long, or when it gets ejected because the queue got too big.
+            Removes this _QueuedRequest from the queue, and calls the request callback to signal a timeout.
+        """
+        if self.already_timed_out:
+            logging.error("_QueuedRequest.on_queue_timeout() should only be called once.")
+        self.already_timed_out = True
+
+        logging.error("Cannot handle outbound requests fast enough! %s" % error_msg)
+        # TODO(simon): We NEED to trigger some sort of alert here. This is a serious error condition.
+
+        if remove_from_queue:
+            try:
+                self.async_http_client.queue.remove(self)
+            except ValueError:
+                logging.error("(Simon) Tried to remove outbound request from queue, but not found in queue. If this is happening, it's a bug and needs to be fixed.")
+        response = HTTPResponse(self.request, 599,  # TODO(simon): Return a 503 instead?
+                                request_time=0.0,  # Usually it's the time elapsed since the _HTTPConnection object was created, but we didn't even get that far.
+                                error=HTTPError(599, error_msg)))
+        if self.callback is not None:
+            self.callback(response)
+
+    def cancel_timeout(self):
+        """ This is called when the request exits the wait queue. """
+        self.async_http_client.io_loop.remove_timeout(self.queue_timeout_handle)
+        if self.already_timed_out:
+            logging.error("_QueuedRequest.cancel_timeout() called after timeout was triggered.")
 
 
 class _HTTPConnection(object):
