@@ -184,7 +184,7 @@ class _QueuedRequest(object):
                 logging.error("(Simon) Tried to remove outbound request from queue, but not found in queue. If this is happening, it's a bug and needs to be fixed.")
         response = HTTPResponse(self.request, 599,  # TODO(simon): Return a 503 instead?
                                 request_time=0.0,  # Usually it's the time elapsed since the _HTTPConnection object was created, but we didn't even get that far.
-                                error=HTTPError(599, error_msg)))
+                                error=HTTPError(599, error_msg))
         if self.callback is not None:
             self.callback(response)
 
