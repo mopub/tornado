@@ -40,8 +40,6 @@ try:
 except ImportError:
     ssl = None
 
-from utils.decorators import time_func
-
 try:
     from prod_staging_constants import DNS_TTL
 except ImportError:
@@ -282,7 +280,6 @@ class _HTTPConnection(object):
                                 functools.partial(self._on_connect, parsed,
                                                   parsed_hostname))
 
-    @time_func
     def _getaddrinfo(self, host, port, af):
         """
         Custom getaddrinfo method caches the response
