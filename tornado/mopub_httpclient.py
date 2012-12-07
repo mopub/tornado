@@ -520,6 +520,7 @@ class _HTTPConnection(object):
             self.headers.get("Content-Encoding") == "gzip"):
             # Magic parameter makes zlib module understand gzip header
             # http://stackoverflow.com/questions/1838699/how-can-i-decompress-a-gzip-stream-with-zlib
+            logging.warning('Received gzip response from %s' % self.request.url)
             self._decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
         if self.headers.get("Transfer-Encoding") == "chunked":
             self.chunks = []
