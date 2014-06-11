@@ -35,6 +35,13 @@ try:
 except ImportError:
     ssl = None
 
+try:
+    from tornado.platform.posix import _set_nonblocking
+except ImportError:
+    _set_nonblocking = None
+
+class StreamClosedError(IOError):
+    pass
 
 class IOStream(object):
     r"""A utility class to write to and read from a non-blocking socket.
@@ -419,8 +426,14 @@ class IOStream(object):
             chunk = self._read_from_socket()
         except socket.error, e:
             # ssl.SSLError is a subclass of socket.error
-            logging.warning("Read error on %d: %s",
-                            self.socket.fileno(), e)
+            if e.args[0] == errno.ECONNRESET:
+                # Treat ECONNRESET as a connection close rather than
+                # an error to minimize log spam  (the exception will
+                # be available on self.error for apps that care).
+                self.close()
+                return
+            gen_log.warning("Read error on %d: %s",
+                            self.fileno(), e)
             self.close()
             raise
         if chunk is None:
@@ -558,8 +571,8 @@ class IOStream(object):
         return self._read_buffer.popleft()
 
     def _check_closed(self):
-        if not self.socket:
-            raise IOError("Stream is closed")
+        if self.closed():
+            raise StreamClosedError("Stream is closed")
 
     def _maybe_add_error_listener(self):
         if self._state is None and self._pending_callbacks == 0:
